@@ -11,18 +11,16 @@ const WEB_PORT = parseInt(process.env.WEB_PORT || '5000');
 const DATA_FILE = 'voice_data_final.json';
 
 if (!USER_TOKEN) {
-    console.error('❌ Không tìm thấy BOT_TOKEN trong .env');
+    console.error('❌ Thiếu BOT_TOKEN trong .env');
     process.exit(1);
 }
 
-/* ==========================
-   DISCORD SELF BOT
-========================== */
+/* ================= DISCORD ================= */
 
 const client = new Client({ checkUpdate: false });
 const activeUserSessions = new Map();
 
-/* ---------- DATA ---------- */
+/* ================= DATA ================= */
 
 function loadData() {
     if (!fs.existsSync(DATA_FILE)) return {};
@@ -33,20 +31,20 @@ function loadData() {
     }
 }
 
-function saveVoiceTime(guildId, userId, seconds) {
-    if (seconds <= 0) return;
+function saveVoiceTime(gid, uid, sec) {
+    if (sec <= 0) return;
     const data = loadData();
     const today = new Date().toISOString().slice(0, 10);
 
-    data[guildId] ??= {};
-    data[guildId][userId] ??= {};
-    data[guildId][userId][today] ??= 0;
-    data[guildId][userId][today] += seconds;
+    data[gid] ??= {};
+    data[gid][uid] ??= {};
+    data[gid][uid][today] ??= 0;
+    data[gid][uid][today] += sec;
 
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 4));
 }
 
-/* ---------- AUTO SAVE ---------- */
+/* ================= AUTO SAVE ================= */
 
 setInterval(() => {
     const now = Date.now() / 1000;
@@ -58,71 +56,61 @@ setInterval(() => {
             activeUserSessions.set(key, now);
         }
     }
-}, 60 * 1000);
+}, 60000);
 
-/* ---------- SCAN VOICE ---------- */
+/* ================= VOICE ================= */
 
-async function scanExistingVoiceUsers() {
-    let count = 0;
+async function scanVoice() {
+    let c = 0;
     const now = Date.now() / 1000;
-    client.guilds.cache.forEach(guild => {
-        guild.channels.cache
-            .filter(c => c.isVoice())
-            .forEach(vc => {
-                vc.members.forEach(m => {
-                    const key = `${m.id}:${guild.id}`;
-                    if (!activeUserSessions.has(key)) {
-                        activeUserSessions.set(key, now);
-                        count++;
-                    }
-                });
+    client.guilds.cache.forEach(g => {
+        g.channels.cache.filter(c => c.isVoice()).forEach(vc => {
+            vc.members.forEach(m => {
+                const key = `${m.id}:${g.id}`;
+                if (!activeUserSessions.has(key)) {
+                    activeUserSessions.set(key, now);
+                    c++;
+                }
             });
+        });
     });
-    console.log(`✅ Đã quét ${count} user đang ngồi voice`);
+    console.log(`✅ Quét ${c} user đang voice`);
 }
 
-/* ---------- EVENTS ---------- */
-
 client.on('ready', async () => {
-    console.log(`✅ Logged in as ${client.user.username}`);
-    console.log(`🔒 Web UI: http://localhost:${WEB_PORT}`);
-    await scanExistingVoiceUsers();
+    console.log(`✅ Logged in: ${client.user.username}`);
+    console.log(`🌐 Web: http://localhost:${WEB_PORT}`);
+    await scanVoice();
 });
 
-client.on('voiceStateUpdate', (oldState, newState) => {
-    const uid = newState.id;
-    const gid = newState.guild.id;
+client.on('voiceStateUpdate', (oldS, newS) => {
+    const uid = newS.id;
+    const gid = newS.guild.id;
     const key = `${uid}:${gid}`;
     const now = Date.now() / 1000;
 
-    if (!oldState.channelId && newState.channelId) {
+    if (!oldS.channelId && newS.channelId) {
         activeUserSessions.set(key, now);
     }
 
-    if (oldState.channelId && !newState.channelId) {
-        if (activeUserSessions.has(key)) {
-            const start = activeUserSessions.get(key);
-            activeUserSessions.delete(key);
-            saveVoiceTime(gid, uid, Math.floor(now - start));
-        }
+    if (oldS.channelId && !newS.channelId && activeUserSessions.has(key)) {
+        saveVoiceTime(gid, uid, Math.floor(now - activeUserSessions.get(key)));
+        activeUserSessions.delete(key);
     }
 });
 
-/* ==========================
-   WEB SERVER
-========================== */
+/* ================= WEB ================= */
 
 const app = express();
-
-app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(session({
     secret: Math.random().toString(36),
     resave: false,
     saveUninitialized: false
 }));
 
-function loginRequired(req, res, next) {
+function auth(req, res, next) {
     if (!req.session.logged) return res.redirect('/login');
     next();
 }
@@ -130,12 +118,7 @@ function loginRequired(req, res, next) {
 /* ---------- LOGIN ---------- */
 
 app.get('/login', (req, res) => {
-    res.send(`
-        <form method="POST">
-            <input type="password" name="password" placeholder="Password"/>
-            <button>Login</button>
-        </form>
-    `);
+    res.sendFile(path.join(__dirname, 'login.html'));
 });
 
 app.post('/login', (req, res) => {
@@ -143,7 +126,7 @@ app.post('/login', (req, res) => {
         req.session.logged = true;
         res.redirect('/');
     } else {
-        res.send('Sai mật khẩu');
+        res.send(`<script>alert("Sai mật khẩu");location="/login"</script>`);
     }
 });
 
@@ -151,62 +134,59 @@ app.get('/logout', (req, res) => {
     req.session.destroy(() => res.redirect('/login'));
 });
 
-/* ---------- DASHBOARD ---------- */
+/* ---------- UI ---------- */
 
-app.get('/', loginRequired, (req, res) => {
+app.get('/', auth, (req, res) => {
     res.sendFile(path.join(__dirname, 'dashboard.html'));
 });
 
 /* ---------- API ---------- */
 
-app.get('/api/servers', loginRequired, (req, res) => {
-    const servers = [...client.guilds.cache.values()]
+app.get('/api/servers', auth, (req, res) => {
+    res.json([...client.guilds.cache.values()]
         .map(g => ({ id: g.id, name: g.name }))
-        .sort((a, b) => a.name.localeCompare(b.name));
-    res.json(servers);
+        .sort((a, b) => a.name.localeCompare(b.name)));
 });
 
-app.get('/api/stats', loginRequired, (req, res) => {
+app.get('/api/stats', auth, (req, res) => {
     const { guild_id, days = 7 } = req.query;
     const data = loadData();
     const cutoff = Date.now() - days * 86400000;
     const now = Date.now() / 1000;
-
-    const finalStats = {};
+    const final = {};
 
     if (data[guild_id]) {
         for (const uid in data[guild_id]) {
-            for (const date in data[guild_id][uid]) {
-                if (new Date(date).getTime() >= cutoff) {
-                    finalStats[uid] ??= 0;
-                    finalStats[uid] += data[guild_id][uid][date];
+            for (const d in data[guild_id][uid]) {
+                if (new Date(d).getTime() >= cutoff) {
+                    final[uid] ??= 0;
+                    final[uid] += data[guild_id][uid][d];
                 }
             }
         }
     }
 
-    for (const [key, start] of activeUserSessions.entries()) {
-        const [uid, gid] = key.split(':');
+    for (const [k, start] of activeUserSessions.entries()) {
+        const [uid, gid] = k.split(':');
         if (gid === guild_id) {
-            finalStats[uid] ??= 0;
-            finalStats[uid] += Math.floor(now - start);
+            final[uid] ??= 0;
+            final[uid] += Math.floor(now - start);
         }
     }
 
-    const guild = client.guilds.cache.get(guild_id);
+    const g = client.guilds.cache.get(guild_id);
     const result = [];
 
-    for (const uid in finalStats) {
-        const member = guild?.members.cache.get(uid);
-        const seconds = finalStats[uid];
-        const h = Math.floor(seconds / 3600);
-        const m = Math.floor(seconds % 3600 / 60);
-        const s = seconds % 60;
+    for (const uid in final) {
+        const s = final[uid];
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
 
         result.push({
-            name: member?.displayName || `User ${uid}`,
-            time_str: `${h ? h + 'h ' : ''}${m ? m + 'm ' : ''}${s}s`,
-            seconds,
+            name: g?.members.cache.get(uid)?.displayName || `User ${uid}`,
+            seconds: s,
+            time_str: `${h ? h + 'h ' : ''}${m ? m + 'm ' : ''}${sec}s`,
             is_online: activeUserSessions.has(`${uid}:${guild_id}`)
         });
     }
@@ -215,10 +195,25 @@ app.get('/api/stats', loginRequired, (req, res) => {
     res.json(result);
 });
 
-/* ---------- START ---------- */
+/* ---------- RESET ---------- */
 
-app.listen(WEB_PORT, () => {
-    console.log(`🌐 Web server running on port ${WEB_PORT}`);
+app.post('/api/reset', auth, (req, res) => {
+    const { guild_id } = req.body;
+    const data = loadData();
+
+    delete data[guild_id];
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 4));
+
+    for (const k of activeUserSessions.keys()) {
+        if (k.endsWith(`:${guild_id}`)) {
+            activeUserSessions.set(k, Date.now() / 1000);
+        }
+    }
+
+    res.json({ ok: true });
 });
 
+/* ---------- START ---------- */
+
+app.listen(WEB_PORT);
 client.login(USER_TOKEN);
