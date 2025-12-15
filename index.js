@@ -1,101 +1,224 @@
 require('dotenv').config();
-const { Client } = require('discord.js-selfbot-v13');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const session = require('express-session');
-const fs = require('fs');
+const { Client } = require('discord.js-selfbot-v13');
 
-// --- CONFIG ---
-const CONFIG = {
-    TOKEN: process.env.BOT_TOKEN,
-    PASS: process.env.WEB_PASSWORD || "admin",
-    PORT: process.env.WEB_PORT || 5000,
-    FILE: "voice_data_final.json"
-};
+const USER_TOKEN = process.env.BOT_TOKEN;
+const WEB_PASSWORD = process.env.WEB_PASSWORD || 'admin';
+const WEB_PORT = parseInt(process.env.WEB_PORT || '5000');
+const DATA_FILE = 'voice_data_final.json';
 
-if (!CONFIG.TOKEN) { console.error("❌ Thiếu BOT_TOKEN trong .env"); process.exit(1); }
+if (!USER_TOKEN) {
+    console.error('❌ Không tìm thấy BOT_TOKEN trong .env');
+    process.exit(1);
+}
 
-// --- DATA HANDLER ---
-const active = new Map();
-const loadDB = () => fs.existsSync(CONFIG.FILE) ? JSON.parse(fs.readFileSync(CONFIG.FILE)) : {};
-const saveDB = (gid, uid, sec) => {
-    if (sec <= 0 || !gid) return;
-    const db = loadDB(), date = new Date().toISOString().split('T')[0];
-    if (!db[gid]) db[gid] = {}; if (!db[gid][uid]) db[gid][uid] = {};
-    db[gid][uid][date] = (db[gid][uid][date] || 0) + sec;
-    fs.writeFileSync(CONFIG.FILE, JSON.stringify(db, null, 2));
-};
+/* ==========================
+   DISCORD SELF BOT
+========================== */
 
-// --- BOT LOGIC ---
 const client = new Client({ checkUpdate: false });
+const activeUserSessions = new Map();
 
-client.on('ready', () => {
-    console.log(`✅ Bot: ${client.user.tag} | 🌍 Web: http://localhost:${CONFIG.PORT}`);
-    client.guilds.cache.forEach(g => g.voiceStates?.cache.forEach(vs => {
-        if (vs.channelId) active.set(`${vs.userId}-${g.id}`, Date.now());
-    }));
+/* ---------- DATA ---------- */
+
+function loadData() {
+    if (!fs.existsSync(DATA_FILE)) return {};
+    try {
+        return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    } catch {
+        return {};
+    }
+}
+
+function saveVoiceTime(guildId, userId, seconds) {
+    if (seconds <= 0) return;
+    const data = loadData();
+    const today = new Date().toISOString().slice(0, 10);
+
+    data[guildId] ??= {};
+    data[guildId][userId] ??= {};
+    data[guildId][userId][today] ??= 0;
+    data[guildId][userId][today] += seconds;
+
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 4));
+}
+
+/* ---------- AUTO SAVE ---------- */
+
+setInterval(() => {
+    const now = Date.now() / 1000;
+    for (const [key, start] of activeUserSessions.entries()) {
+        const dur = Math.floor(now - start);
+        if (dur > 0) {
+            const [uid, gid] = key.split(':');
+            saveVoiceTime(gid, uid, dur);
+            activeUserSessions.set(key, now);
+        }
+    }
+}, 60 * 1000);
+
+/* ---------- SCAN VOICE ---------- */
+
+async function scanExistingVoiceUsers() {
+    let count = 0;
+    const now = Date.now() / 1000;
+    client.guilds.cache.forEach(guild => {
+        guild.channels.cache
+            .filter(c => c.isVoice())
+            .forEach(vc => {
+                vc.members.forEach(m => {
+                    const key = `${m.id}:${guild.id}`;
+                    if (!activeUserSessions.has(key)) {
+                        activeUserSessions.set(key, now);
+                        count++;
+                    }
+                });
+            });
+    });
+    console.log(`✅ Đã quét ${count} user đang ngồi voice`);
+}
+
+/* ---------- EVENTS ---------- */
+
+client.on('ready', async () => {
+    console.log(`✅ Logged in as ${client.user.username}`);
+    console.log(`🔒 Web UI: http://localhost:${WEB_PORT}`);
+    await scanExistingVoiceUsers();
 });
 
-client.on('voiceStateUpdate', (oldS, newS) => {
-    const key = `${newS.userId}-${newS.guild.id}`, now = Date.now();
-    if (!oldS.channelId && newS.channelId) active.set(key, now); // Join
-    else if (oldS.channelId && !newS.channelId && active.has(key)) { // Leave
-        saveDB(newS.guild.id, newS.userId, Math.floor((now - active.get(key))/1000));
-        active.delete(key);
+client.on('voiceStateUpdate', (oldState, newState) => {
+    const uid = newState.id;
+    const gid = newState.guild.id;
+    const key = `${uid}:${gid}`;
+    const now = Date.now() / 1000;
+
+    if (!oldState.channelId && newState.channelId) {
+        activeUserSessions.set(key, now);
+    }
+
+    if (oldState.channelId && !newState.channelId) {
+        if (activeUserSessions.has(key)) {
+            const start = activeUserSessions.get(key);
+            activeUserSessions.delete(key);
+            saveVoiceTime(gid, uid, Math.floor(now - start));
+        }
     }
 });
 
-setInterval(() => { // Auto Save mỗi phút
-    const now = Date.now();
-    active.forEach((start, key) => {
-        const [uid, gid] = key.split('-');
-        if (now - start > 1000) { saveDB(gid, uid, Math.floor((now - start)/1000)); active.set(key, now); }
-    });
-}, 60000);
+/* ==========================
+   WEB SERVER
+========================== */
 
-// --- WEB SERVER ---
 const app = express();
+
 app.use(express.urlencoded({ extended: true }));
-app.use(session({ secret: 'secret', resave: false, saveUninitialized: true }));
-const auth = (req, res, next) => req.session.log ? next() : res.redirect('/login');
+app.use(express.json());
+app.use(session({
+    secret: Math.random().toString(36),
+    resave: false,
+    saveUninitialized: false
+}));
 
-// HTML Minified
-const HTML_LOGIN = (err='') => `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>Login</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>body{background:#121212;color:#fff;height:100vh;display:flex;align-items:center;justify-content:center}.box{background:#1e1e1e;padding:40px;border-radius:10px;width:350px}</style></head><body><div class="box"><h3 class="text-center mb-4">🔐 Đăng Nhập</h3>${err?`<div class="alert alert-danger text-center">${err}</div>`:''}<form method="POST"><input type="password" name="p" class="form-control mb-3" placeholder="Mật khẩu..." required><button class="btn btn-primary w-100">Login</button></form></div></body></html>`;
-const HTML_DASH = `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>Voice Tracker</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>body{background:#0f0f0f;color:#e0e0e0;overflow:hidden}.sidebar{height:100vh;background:#161616;border-right:1px solid #333}.sv{cursor:pointer;padding:10px;margin:5px 0;border-radius:5px}.sv:hover{background:#2a2a2a}.sv.active{background:#5865F2;color:#fff}.main{height:100vh;overflow-y:auto;padding:30px}.live{background:red;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;animation:p 1.5s infinite}@keyframes p{0%{opacity:1}50%{opacity:.5}100%{opacity:1}}</style></head><body><div class="container-fluid"><div class="row"><div class="col-2 sidebar p-3"><input id="s" class="form-control form-control-sm mb-3" placeholder="🔍 Tìm..." style="background:#222;border:0;color:#fff"><div id="list"></div><div class="mt-3 text-center"><a href="/logout" class="text-muted small">Logout</a></div></div><div class="col-10 main"><div class="d-flex justify-content-between mb-4"><h3 id="tt">🔴 Dashboard</h3><div>Ngày: <input type="number" id="d" value="7" style="width:50px;background:#222;color:#fff;border:0;text-align:center"></div></div><table class="table table-dark"><thead><tr><th>#</th><th>User</th><th class="text-end">Status</th><th class="text-end">Time</th></tr></thead><tbody id="tb"></tbody></table></div></div></div><script>let cid=null;async function L(){const r=await fetch('/api/sv');const d=await r.json();const l=document.getElementById('list');l.innerHTML='';d.forEach(s=>{const e=document.createElement('div');e.className='sv';e.innerText=s.n;e.onclick=()=>{cid=s.id;document.getElementById('tt').innerText=s.n;document.querySelectorAll('.sv').forEach(x=>x.classList.remove('active'));e.classList.add('active');F()};l.appendChild(e)})}async function F(){if(!cid)return;const dy=document.getElementById('d').value;const r=await fetch('/api/st?id='+cid+'&d='+dy);const d=await r.json();const b=document.getElementById('tb');b.innerHTML='';d.forEach((u,i)=>{b.innerHTML+='<tr><td>'+(i+1)+'</td><td>'+u.n+'</td><td class="text-end">'+(u.on?'<span class="live">LIVE</span>':'Off')+'</td><td class="text-end">'+u.t+'</td></tr>'})}document.getElementById('s').oninput=e=>{const v=e.target.value.toLowerCase();document.querySelectorAll('.sv').forEach(x=>{x.style.display=x.innerText.toLowerCase().includes(v)?'block':'none'})};setInterval(F,2000);L();</script></body></html>`;
+function loginRequired(req, res, next) {
+    if (!req.session.logged) return res.redirect('/login');
+    next();
+}
 
-// --- ROUTES ---
-app.get('/login', (req, res) => res.send(HTML_LOGIN()));
+/* ---------- LOGIN ---------- */
+
+app.get('/login', (req, res) => {
+    res.send(`
+        <form method="POST">
+            <input type="password" name="password" placeholder="Password"/>
+            <button>Login</button>
+        </form>
+    `);
+});
+
 app.post('/login', (req, res) => {
-    if (req.body.p === CONFIG.PASS) { req.session.log = true; res.redirect('/'); }
-    else res.send(HTML_LOGIN("Sai mật khẩu!"));
-});
-app.get('/logout', (req, res) => { req.session.destroy(); res.redirect('/login'); });
-app.get('/', auth, (req, res) => res.send(HTML_DASH));
-
-app.get('/api/sv', auth, (req, res) => {
-    res.json(client.guilds.cache.map(g => ({ id: g.id, n: g.name })).sort((a,b)=>a.n.localeCompare(b.n)));
+    if (req.body.password === WEB_PASSWORD) {
+        req.session.logged = true;
+        res.redirect('/');
+    } else {
+        res.send('Sai mật khẩu');
+    }
 });
 
-app.get('/api/st', auth, (req, res) => {
-    const { id, d } = req.query;
-    const db = loadDB(), final = {};
-    const cut = new Date(); cut.setDate(cut.getDate() - (d || 7));
-    
-    if (db[id]) Object.entries(db[id]).forEach(([u, dates]) => {
-        Object.entries(dates).forEach(([dt, s]) => {
-            if (new Date(dt) >= cut || dt === new Date().toISOString().split('T')[0]) final[u] = (final[u]||0)+s;
+app.get('/logout', (req, res) => {
+    req.session.destroy(() => res.redirect('/login'));
+});
+
+/* ---------- DASHBOARD ---------- */
+
+app.get('/', loginRequired, (req, res) => {
+    res.sendFile(path.join(__dirname, 'dashboard.html'));
+});
+
+/* ---------- API ---------- */
+
+app.get('/api/servers', loginRequired, (req, res) => {
+    const servers = [...client.guilds.cache.values()]
+        .map(g => ({ id: g.id, name: g.name }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+    res.json(servers);
+});
+
+app.get('/api/stats', loginRequired, (req, res) => {
+    const { guild_id, days = 7 } = req.query;
+    const data = loadData();
+    const cutoff = Date.now() - days * 86400000;
+    const now = Date.now() / 1000;
+
+    const finalStats = {};
+
+    if (data[guild_id]) {
+        for (const uid in data[guild_id]) {
+            for (const date in data[guild_id][uid]) {
+                if (new Date(date).getTime() >= cutoff) {
+                    finalStats[uid] ??= 0;
+                    finalStats[uid] += data[guild_id][uid][date];
+                }
+            }
+        }
+    }
+
+    for (const [key, start] of activeUserSessions.entries()) {
+        const [uid, gid] = key.split(':');
+        if (gid === guild_id) {
+            finalStats[uid] ??= 0;
+            finalStats[uid] += Math.floor(now - start);
+        }
+    }
+
+    const guild = client.guilds.cache.get(guild_id);
+    const result = [];
+
+    for (const uid in finalStats) {
+        const member = guild?.members.cache.get(uid);
+        const seconds = finalStats[uid];
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor(seconds % 3600 / 60);
+        const s = seconds % 60;
+
+        result.push({
+            name: member?.displayName || `User ${uid}`,
+            time_str: `${h ? h + 'h ' : ''}${m ? m + 'm ' : ''}${s}s`,
+            seconds,
+            is_online: activeUserSessions.has(`${uid}:${guild_id}`)
         });
-    });
-    
-    const now = Date.now();
-    active.forEach((st, k) => { if(k.endsWith(id)) final[k.split('-')[0]] = (final[k.split('-')[0]]||0) + Math.floor((now-st)/1000); });
+    }
 
-    res.json(Object.entries(final).map(([u, s]) => {
-        let n = `User ${u}`, mem = client.guilds.cache.get(id)?.members.cache.get(u) || client.users.cache.get(u);
-        if (mem) n = mem.displayName || mem.username;
-        const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sc=s%60;
-        return { n, on: active.has(`${u}-${id}`), t: `${h>0?h+'h ':''}${m>0?m+'m ':''}${sc}s`, s };
-    }).sort((a,b)=>b.s-a.s));
+    result.sort((a, b) => b.seconds - a.seconds);
+    res.json(result);
 });
 
-app.listen(CONFIG.PORT);
-client.login(CONFIG.TOKEN);
+/* ---------- START ---------- */
+
+app.listen(WEB_PORT, () => {
+    console.log(`🌐 Web server running on port ${WEB_PORT}`);
+});
+
+client.login(USER_TOKEN);
